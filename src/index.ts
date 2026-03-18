@@ -18,7 +18,10 @@ const createWhatsappGateway = async (): Promise<WhatsappGateway | undefined> => 
 
   const { Client: WhatsAppClient, LocalAuth } = WhatsApp;
   const client = new WhatsAppClient({
-    authStrategy: new LocalAuth({ clientId: "vector-xlab-core" })
+    authStrategy: new LocalAuth({ clientId: "vector-xlab-core" }),
+    puppeteer: {
+      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    }
   });
   await client.initialize();
   return {
