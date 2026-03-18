@@ -1,7 +1,7 @@
 import "@elizaos/core";
 
 import { Telegraf, Markup } from "telegraf";
-import { Client as WhatsAppClient, LocalAuth } from "whatsapp-web.js";
+import WhatsApp from "whatsapp-web.js";
 
 import { VectorBridge, WhatsappGateway } from "./services/bridge/VectorBridge.js";
 import {
@@ -16,6 +16,7 @@ const createWhatsappGateway = async (): Promise<WhatsappGateway | undefined> => 
     return undefined;
   }
 
+  const { Client: WhatsAppClient, LocalAuth } = WhatsApp;
   const client = new WhatsAppClient({
     authStrategy: new LocalAuth({ clientId: "vector-xlab-core" })
   });
