@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.wwebjs_auth/
+.wwebjs_cache/
+pending_tasks.json
+.env
+.env.local
+npm-debug.log*

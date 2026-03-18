@@ -1,0 +1,30 @@
+{
+  "name": "vector-xlab-core",
+  "version": "0.1.0",
+  "description": "Vector-XLAB-Core: OMNI global commercial execution engine",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@0glabs/0g-ts-sdk": "^0.3.3",
+    "@elizaos/core": "^0.1.0",
+    "ethers": "^6.13.0",
+    "telegraf": "^4.16.3",
+    "whatsapp-web.js": "^1.26.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
