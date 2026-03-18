@@ -41,6 +41,12 @@ npm start
 
 ## 环境变量
 
+先复制示例配置：
+
+```bash
+cp .env.example .env
+```
+
 在项目根目录创建 `.env`（或通过系统环境变量注入）：
 
 ```env
