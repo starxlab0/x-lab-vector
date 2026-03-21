@@ -1,5 +1,9 @@
 import "@elizaos/core";
 
+import { readFile, rm, writeFile } from "node:fs/promises";
+import { exec as execCallback } from "node:child_process";
+import { promisify } from "node:util";
+
 import { Telegraf, Markup } from "telegraf";
 import WhatsApp from "whatsapp-web.js";
 
@@ -16,6 +20,21 @@ const createWhatsappGateway = async (): Promise<WhatsappGateway | undefined> => 
     return undefined;
   }
 
+  const exec = promisify(execCallback);
+  await exec("pkill -9 -f chrome-linux64/chrome").catch(() => undefined);
+  await exec("pkill -9 -f 'Google Chrome for Testing'").catch(() => undefined);
+
+  const sessionDir = ".wwebjs_auth/session-vector-xlab-core";
+  const singletonPaths = [
+    `${sessionDir}/SingletonLock`,
+    `${sessionDir}/SingletonSocket`,
+    `${sessionDir}/SingletonCookie`,
+    `${sessionDir}/Default/SingletonLock`,
+    `${sessionDir}/Default/SingletonSocket`,
+    `${sessionDir}/Default/SingletonCookie`
+  ];
+  await Promise.all(singletonPaths.map((target) => rm(target, { force: true })));
+
   const { Client: WhatsAppClient, LocalAuth } = WhatsApp;
   const client = new WhatsAppClient({
     authStrategy: new LocalAuth({ clientId: "vector-xlab-core" }),
@@ -23,9 +42,52 @@ const createWhatsappGateway = async (): Promise<WhatsappGateway | undefined> => 
       args: ["--no-sandbox", "--disable-setuid-sandbox"]
     }
   });
-  await client.initialize();
+  const readyPromise = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error("WhatsApp client ready timeout"));
+    }, 12000);
+    const onReady = () => {
+      clearTimeout(timeout);
+      resolve();
+    };
+    const onAuthFailure = (message: string) => {
+      clearTimeout(timeout);
+      reject(new Error(`WhatsApp auth failure: ${message}`));
+    };
+    const onDisconnected = (reason: string) => {
+      clearTimeout(timeout);
+      reject(new Error(`WhatsApp disconnected before ready: ${reason}`));
+    };
+    client.once("ready", onReady);
+    client.once("auth_failure", onAuthFailure);
+    client.once("disconnected", onDisconnected);
+  });
+  void client.initialize();
+  await readyPromise;
   return {
-    sendMessage: (chatId, content) => client.sendMessage(chatId, content),
+    sendMessage: async (chatId, content) => {
+      try {
+        const normalizedChatId = chatId.trim();
+        if (!normalizedChatId) {
+          throw new Error("empty chat id");
+        }
+
+        let targetChatId = normalizedChatId;
+        if (normalizedChatId.endsWith("@c.us")) {
+          const phoneNumber = normalizedChatId.slice(0, -5);
+          const numberId = await client.getNumberId(phoneNumber);
+          if (!numberId) {
+            throw new Error(`number not registered on WhatsApp: ${phoneNumber}`);
+          }
+          targetChatId = typeof numberId === "string" ? numberId : numberId._serialized;
+        }
+
+        return await client.sendMessage(targetChatId, content);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`WhatsApp send failed for ${chatId}: ${message}`);
+      }
+    },
     onMessage: (listener) => {
       client.on("message", (message) => {
         void listener({
@@ -50,9 +112,15 @@ const createWhatsappGateway = async (): Promise<WhatsappGateway | undefined> => 
 
 export const bootstrapVectorCore = async () => {
   const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
-  const bossChatId = process.env.TELEGRAM_BOSS_CHAT_ID;
+  let bossChatId = process.env.TELEGRAM_BOSS_CHAT_ID;
   const agentChatId = process.env.WA_AGENT_CHAT_ID ?? "971000000000@c.us";
-  const whatsappGateway = await createWhatsappGateway();
+  let whatsappGateway: WhatsappGateway | undefined;
+  try {
+    whatsappGateway = await createWhatsappGateway();
+  } catch (error) {
+    console.error("[VectorCore] WhatsApp gateway init failed, continue with Telegram-only mode", error);
+    whatsappGateway = undefined;
+  }
 
   if (!telegramToken) {
     return {
@@ -63,6 +131,11 @@ export const bootstrapVectorCore = async () => {
   }
 
   const bot = new Telegraf(telegramToken);
+  bot.catch((error, ctx) => {
+    const callbackData = ctx.callbackQuery && "data" in ctx.callbackQuery ? ctx.callbackQuery.data : "n/a";
+    console.error(`[VectorCore] bot handler error: callbackData=${callbackData}`, error);
+  });
+
   const bridge = new VectorBridge({
     agentChatId,
     whatsappGateway,
@@ -103,6 +176,35 @@ export const bootstrapVectorCore = async () => {
     await ctx.reply("请选择执行国家：", Markup.inlineKeyboard(buildCountryButtons()));
   });
 
+  bot.command("whoami", async (ctx) => {
+    const chatId = String(ctx.chat.id);
+    const role = bossChatId === chatId ? "boss" : "operator";
+    await ctx.reply(`chat_id=${chatId}\nrole=${role}`);
+  });
+
+  bot.command("setboss", async (ctx) => {
+    const text = ctx.message && "text" in ctx.message ? ctx.message.text : "";
+    const explicitChatId = text.split(" ").slice(1).join(" ").trim();
+    const nextBossChatId = explicitChatId || String(ctx.chat.id);
+    bossChatId = nextBossChatId;
+    try {
+      const envPath = `${process.cwd()}/.env`;
+      const envContent = await readFile(envPath, "utf-8");
+      const nextEnvContent = envContent.match(/^TELEGRAM_BOSS_CHAT_ID=/m)
+        ? envContent.replace(/^TELEGRAM_BOSS_CHAT_ID=.*$/m, `TELEGRAM_BOSS_CHAT_ID=${nextBossChatId}`)
+        : `${envContent.trimEnd()}\nTELEGRAM_BOSS_CHAT_ID=${nextBossChatId}\n`;
+      await writeFile(envPath, nextEnvContent, "utf-8");
+      await ctx.reply(`✅ boss chat 已切换为: ${bossChatId}`);
+    } catch (error) {
+      console.error(`[VectorCore] setboss persist failed: target=${nextBossChatId}`, error);
+      await ctx.reply(`⚠️ boss chat 已切换(内存): ${bossChatId}，但写入 .env 失败`);
+    }
+  });
+
+  bot.command("currentboss", async (ctx) => {
+    await ctx.reply(`current boss chat id: ${bossChatId ?? "未设置"}`);
+  });
+
   bot.action(/^country:(.+)$/, async (ctx) => {
     const countryCode = String(ctx.match[1]).toUpperCase();
     const services = resolveCountryServices(countryCode);
@@ -125,17 +227,26 @@ export const bootstrapVectorCore = async () => {
       return;
     }
 
-    const dispatchResult = await bridge.dispatchTask(parsed.countryCode, parsed.action);
-    await ctx.reply(
-      [
-        `✅ 已下发任务`,
-        `Task ID: ${dispatchResult.task.taskId}`,
-        `Service: ${dispatchResult.task.serviceLine}`,
-        `Agent Channel: ${agentChatId}`
-      ].join("\n")
-    );
-    await ctx.reply(`Instruction sent to agent:\n${dispatchResult.instruction}`);
-    await ctx.answerCbQuery("任务已下发");
+    try {
+      const dispatchResult = await bridge.dispatchTask(parsed.countryCode, parsed.action);
+      await ctx.reply(
+        [
+          `✅ 已下发任务`,
+          `Task ID: ${dispatchResult.task.taskId}`,
+          `Service: ${dispatchResult.task.serviceLine}`,
+          `Agent Channel: ${agentChatId}`
+        ].join("\n")
+      );
+      await ctx.reply(`Instruction sent to agent:\n${dispatchResult.instruction}`);
+      await ctx.answerCbQuery("任务已下发");
+    } catch (error) {
+      console.error(
+        `[VectorCore] task dispatch failed: country=${parsed.countryCode}, action=${parsed.action}, agentChatId=${agentChatId}`,
+        error
+      );
+      await ctx.answerCbQuery("下发失败，请检查 WA 登录状态", { show_alert: true });
+      await ctx.reply("❌ 任务下发失败：请检查 WhatsApp 登录状态和 WA_AGENT_CHAT_ID");
+    }
   });
 
   bot.command("evidence", async (ctx) => {
@@ -149,13 +260,37 @@ export const bootstrapVectorCore = async () => {
     console.info(`[VectorCore] manual evidence trigger: taskId=${taskId}`);
     const sampleImageBuffer = Buffer.from(`vector-evidence:${taskId}:${Date.now()}`, "utf-8");
     const result = await bridge.processTaskEvidence(taskId, sampleImageBuffer);
-    await ctx.reply(result.bossView, Markup.inlineKeyboard([[Markup.button.url("查看 0G 浏览器证据", result.proofUrl)]]));
-    await ctx.reply(result.expertView);
-    await ctx.reply(result.buyerView);
+    await ctx.reply(
+      [
+        `✅ 已触发证据处理`,
+        `Task ID: ${taskId}`,
+        `Storage Status: ${result.storageStatus}`,
+        `Boss 账号将收到完整三视角推送`
+      ].join("\n"),
+      Markup.inlineKeyboard([[Markup.button.url("查看 0G 浏览器证据", result.proofUrl)]])
+    );
     await ctx.reply(`Storage Status: ${result.storageStatus}`);
   });
 
-  await bot.launch();
+  let launched = false;
+  while (!launched) {
+    try {
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+      await bot.launch({ dropPendingUpdates: true });
+      launched = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const isPollingConflict =
+        message.includes("409") ||
+        message.includes("terminated by other getUpdates request") ||
+        message.includes("Conflict");
+      if (!isPollingConflict) {
+        throw error;
+      }
+      console.warn(`[VectorCore] telegram polling conflict detected, retrying launch in 3s: ${message}`);
+      await new Promise((resolveLaunchRetry) => setTimeout(resolveLaunchRetry, 3000));
+    }
+  }
   return {
     status: "running",
     bridge,
