@@ -8,6 +8,7 @@ export const VectorTaskSchema = z.object({
   taskId: z.string().min(1),
   country: z.string().min(2),
   serviceLine: z.string().min(1),
+  taskDescription: z.string().min(1).optional(),
   status: z.enum(TASK_STATUS),
   rewardAmount: z.number().default(0),
   rating: z.number().min(1).max(5).optional(),
@@ -35,10 +36,29 @@ export const VectorTaskSchema = z.object({
 
 export type VectorTask = z.infer<typeof VectorTaskSchema>;
 
-export const createBuyerGatewayTemplate = (task: Pick<VectorTask, "taskId" | "country" | "serviceLine">) => {
+const generateExecutiveSummaryWithElizaLogic = (task: {
+  taskId: string;
+  country: string;
+  serviceLine: string;
+  taskDescription?: string;
+}): string => {
+  const normalizedDescription = task.taskDescription?.trim() ?? "";
+  if (!normalizedDescription) {
+    return `Task ${task.taskId} for ${task.serviceLine} in ${task.country} is positioned as a trust-first execution mandate with measurable field evidence and conversion-ready assurance output.`;
+  }
+  const urgencyTone = /(紧急|urgent|asap|立即|today|24h)/i.test(normalizedDescription)
+    ? "high-urgency"
+    : "planned";
+  const complianceTone = /(合规|compliance|audit|认证|certificate|traceability)/i.test(normalizedDescription)
+    ? "compliance-critical"
+    : "delivery-focused";
+  return `Task ${task.taskId} targets ${task.serviceLine} in ${task.country} with a ${urgencyTone}, ${complianceTone} mandate: ${normalizedDescription}. Buyer-facing confidence is strengthened through verifiable field evidence and auditable execution milestones.`;
+};
+
+export const createBuyerGatewayTemplate = (task: Pick<VectorTask, "taskId" | "country" | "serviceLine" | "taskDescription">) => {
   return {
     title: `Execution Assurance Report - ${task.country}`,
-    executiveSummary: `Task ${task.taskId} for ${task.serviceLine} is progressing with verified operational evidence.`,
+    executiveSummary: generateExecutiveSummaryWithElizaLogic(task),
     trustHighlights: [
       "Field evidence archived with immutable storage proof.",
       "Compliance checkpoints reviewed by certified specialists."
@@ -51,6 +71,7 @@ export const createVectorTask = (input: {
   taskId: string;
   country: string;
   serviceLine: string;
+  taskDescription?: string;
   rewardAmount?: number;
   agentWallet?: string;
 }): VectorTask => {
@@ -58,6 +79,7 @@ export const createVectorTask = (input: {
     taskId: input.taskId,
     country: input.country.toUpperCase(),
     serviceLine: input.serviceLine,
+    taskDescription: input.taskDescription,
     status: "queued",
     rewardAmount: input.rewardAmount ?? 0,
     agentWallet: input.agentWallet,
@@ -77,7 +99,8 @@ export const createVectorTask = (input: {
     buyerGateway: createBuyerGatewayTemplate({
       taskId: input.taskId,
       country: input.country.toUpperCase(),
-      serviceLine: input.serviceLine
+      serviceLine: input.serviceLine,
+      taskDescription: input.taskDescription
     })
   });
 };

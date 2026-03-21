@@ -119,7 +119,11 @@ const createWhatsappGateway = async (): Promise<WhatsappGateway | undefined> => 
 export const bootstrapVectorCore = async () => {
   const telegramToken = process.env.TELEGRAM_BOT_TOKEN;
   let bossChatId = process.env.TELEGRAM_BOSS_CHAT_ID;
-  const agentChatId = process.env.WA_AGENT_CHAT_ID ?? "971000000000@c.us";
+  const configuredAgentChatIds = (process.env.WA_AGENT_CHAT_IDS ?? process.env.WA_AGENT_CHAT_ID ?? "971000000000@c.us")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const agentChatIds = Array.from(new Set(configuredAgentChatIds));
   let whatsappGateway: WhatsappGateway | undefined;
   try {
     whatsappGateway = await createWhatsappGateway();
@@ -143,7 +147,7 @@ export const bootstrapVectorCore = async () => {
   });
 
   const bridge = new VectorBridge({
-    agentChatId,
+    agentChatIds,
     whatsappGateway,
     onThreeViewUpdate: async (payload) => {
       if (!bossChatId) {
@@ -154,10 +158,12 @@ export const bootstrapVectorCore = async () => {
       const reputation = await bridge.getTaskAgentReputation(payload.task.taskId);
       const creditStars = renderCreditStars(reputation?.reputationScore ?? 0);
       const keyboard =
-        payload.storageStatus === "CONFIRMED" && payload.task.status === "completed"
+        payload.storageStatus === "CONFIRMED" && (payload.task.status === "completed" || payload.task.status === "blocked")
           ? Markup.inlineKeyboard([
               [Markup.button.url("查看 0G 浏览器证据", payload.proofUrl)],
-              [Markup.button.callback("✅ 确认验收", `settle:confirm:${payload.task.taskId}`)]
+              ...(payload.task.status === "completed"
+                ? [[Markup.button.callback("✅ 确认验收", `settle:confirm:${payload.task.taskId}`)]]
+                : [])
             ])
           : Markup.inlineKeyboard([[Markup.button.url("查看 0G 浏览器证据", payload.proofUrl)]]);
       const triggerLabel =
@@ -242,24 +248,27 @@ export const bootstrapVectorCore = async () => {
     }
 
     try {
-      const dispatchResult = await bridge.dispatchTask(parsed.countryCode, parsed.action);
+      const dispatchResult = await bridge.dispatchTask(parsed.countryCode, parsed.action, {
+        agentChatIds,
+        taskDescription: `${parsed.countryCode} 市场 ${parsed.action} 任务，需提供可审计的一线证据闭环。`
+      });
       await ctx.reply(
         [
           `✅ 已下发任务`,
           `Task ID: ${dispatchResult.task.taskId}`,
           `Service: ${dispatchResult.task.serviceLine}`,
-          `Agent Channel: ${agentChatId}`
+          `Agent Candidates: ${agentChatIds.join(", ")}`
         ].join("\n")
       );
       await ctx.reply(`Instruction sent to agent:\n${dispatchResult.instruction}`);
       await ctx.answerCbQuery("任务已下发");
     } catch (error) {
       console.error(
-        `[VectorCore] task dispatch failed: country=${parsed.countryCode}, action=${parsed.action}, agentChatId=${agentChatId}`,
+        `[VectorCore] task dispatch failed: country=${parsed.countryCode}, action=${parsed.action}, agentChatIds=${agentChatIds.join(",")}`,
         error
       );
       await ctx.answerCbQuery("下发失败，请检查 WA 登录状态", { show_alert: true });
-      await ctx.reply("❌ 任务下发失败：请检查 WhatsApp 登录状态和 WA_AGENT_CHAT_ID");
+      await ctx.reply("❌ 任务下发失败：请检查 WhatsApp 登录状态和 WA_AGENT_CHAT_IDS");
     }
   });
 

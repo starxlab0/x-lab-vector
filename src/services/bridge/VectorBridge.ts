@@ -41,7 +41,8 @@ export interface RetrySettlementPayload {
 }
 
 export interface VectorBridgeConfig {
-  agentChatId: string;
+  agentChatIds?: string[];
+  agentChatId?: string;
   whatsappGateway?: WhatsappGateway;
   onThreeViewUpdate?: (payload: ThreeViewNotificationPayload) => Promise<void> | void;
   onRetrySettlement?: (payload: RetrySettlementPayload) => Promise<void> | void;
@@ -51,6 +52,8 @@ export interface VectorBridgeConfig {
 export interface DispatchTaskOptions {
   rewardAmount?: number;
   agentWallet?: string;
+  agentChatIds?: string[];
+  taskDescription?: string;
 }
 
 export interface DispatchResult {
@@ -66,10 +69,17 @@ interface PendingQueueEntry {
   updatedAt: string;
 }
 
+interface TaskRoutingState {
+  candidateAgentIds: string[];
+  acceptedAgentId: string | null;
+  acceptedAt: string | null;
+}
+
 export class VectorBridge {
   private readonly tasks = new Map<string, VectorTask>();
   private readonly pendingStorageQueue = new Map<string, PendingQueueEntry>();
-  private readonly agentChatId: string;
+  private readonly taskRouting = new Map<string, TaskRoutingState>();
+  private readonly defaultAgentChatIds: string[];
   private readonly whatsappGateway?: WhatsappGateway;
   private readonly onThreeViewUpdate?: (payload: ThreeViewNotificationPayload) => Promise<void> | void;
   private readonly onRetrySettlement?: (payload: RetrySettlementPayload) => Promise<void> | void;
@@ -78,7 +88,15 @@ export class VectorBridge {
   private readonly retryTimer: NodeJS.Timeout;
 
   constructor(config: VectorBridgeConfig) {
-    this.agentChatId = config.agentChatId;
+    const configuredAgentList = (config.agentChatIds ?? [])
+      .map((item) => this.normalizeChatId(item))
+      .filter(Boolean);
+    const singleAgent = this.normalizeChatId(config.agentChatId ?? "");
+    const fallbackAgents = configuredAgentList.length ? configuredAgentList : singleAgent ? [singleAgent] : [];
+    if (!fallbackAgents.length) {
+      throw new Error("VectorBridge requires at least one agent chat id");
+    }
+    this.defaultAgentChatIds = Array.from(new Set(fallbackAgents));
     this.whatsappGateway = config.whatsappGateway;
     this.onThreeViewUpdate = config.onThreeViewUpdate;
     this.onRetrySettlement = config.onRetrySettlement;
@@ -106,13 +124,15 @@ export class VectorBridge {
       throw new Error(`Unsupported service action: ${action}`);
     }
 
+    const candidateAgentIds = this.resolveCandidateAgentIds(options.agentChatIds);
     const taskId = `VT-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}-${randomUUID().slice(0, 8).toUpperCase()}`;
     const task = createVectorTask({
       taskId,
       country: countryCode,
       serviceLine: capability,
       rewardAmount: options.rewardAmount,
-      agentWallet: options.agentWallet
+      agentWallet: options.agentWallet,
+      taskDescription: options.taskDescription
     });
 
     const instruction = [
@@ -121,14 +141,22 @@ export class VectorBridge {
       `Service: ${capability}`,
       `Reward (USDT): ${task.rewardAmount}`,
       `Ref: [${taskId}]`,
+      `Claim: Reply "Accept: [${taskId}]" to lock this task.`,
       `Instruction: Please execute on-site ${capability.toLowerCase()} and return photo evidence with timestamp and coordinates.`
     ].join("\n");
 
     if (this.whatsappGateway) {
-      await this.whatsappGateway.sendMessage(this.agentChatId, instruction);
+      await Promise.all(candidateAgentIds.map((agentId) => this.whatsappGateway!.sendMessage(agentId, instruction)));
     }
 
-    console.info(`[VectorBridge] task dispatched: taskId=${taskId}, country=${countryCode.toUpperCase()}, action=${action}`);
+    this.taskRouting.set(taskId, {
+      candidateAgentIds,
+      acceptedAgentId: null,
+      acceptedAt: null
+    });
+    console.info(
+      `[VectorBridge] task dispatched: taskId=${taskId}, country=${countryCode.toUpperCase()}, action=${action}, candidates=${candidateAgentIds.join(",")}`
+    );
     this.tasks.set(taskId, task);
     return { task, instruction };
   }
@@ -142,7 +170,8 @@ export class VectorBridge {
     if (!task) {
       return null;
     }
-    const agentId = task.agentWallet?.trim() || this.agentChatId.trim();
+    const routing = this.taskRouting.get(taskId);
+    const agentId = task.agentWallet?.trim() || routing?.acceptedAgentId || this.defaultAgentChatIds[0];
     if (!agentId) {
       return null;
     }
@@ -170,7 +199,8 @@ export class VectorBridge {
     });
     this.tasks.set(taskId, settledTask);
 
-    const agentId = settledTask.agentWallet?.trim() || this.agentChatId.trim();
+    const routing = this.taskRouting.get(taskId);
+    const agentId = settledTask.agentWallet?.trim() || routing?.acceptedAgentId || this.defaultAgentChatIds[0];
     const reputation = agentId ? await this.reputationManager.applySettlementRating(agentId, rating) : null;
     const rewardAmount = Number(settledTask.rewardAmount.toFixed(2));
     const serviceFee = Number((rewardAmount * 0.2).toFixed(2));
@@ -273,6 +303,9 @@ export class VectorBridge {
   ): VectorTask {
     if (storageStatus === "CONFIRMED") {
       const isRetrySettlement = trigger === "retry_queue";
+      if (updatedTask.status === "blocked") {
+        return updatedTask;
+      }
       return VectorTaskSchema.parse({
         ...updatedTask,
         status: "completed",
@@ -301,8 +334,8 @@ export class VectorBridge {
     if (task.status !== "completed" || storageStatus !== "CONFIRMED") {
       return;
     }
-    const fallbackAgentId = this.agentChatId.trim();
-    const agentId = task.agentWallet?.trim() || fallbackAgentId;
+    const routing = this.taskRouting.get(task.taskId);
+    const agentId = task.agentWallet?.trim() || routing?.acceptedAgentId || this.defaultAgentChatIds[0];
     if (!agentId) {
       return;
     }
@@ -387,6 +420,11 @@ export class VectorBridge {
           lastError: item.lastError ?? null,
           updatedAt: item.updatedAt ?? new Date().toISOString()
         };
+        this.taskRouting.set(task.taskId, {
+          candidateAgentIds: this.defaultAgentChatIds,
+          acceptedAgentId: task.agentWallet?.trim() || null,
+          acceptedAt: null
+        });
         this.tasks.set(task.taskId, task);
         this.pendingStorageQueue.set(task.taskId, hydrated);
       }
@@ -414,8 +452,66 @@ export class VectorBridge {
     return taskMatch?.[1] ?? null;
   }
 
+  private parseAcceptTaskIdFromMessage(text: string): string | null {
+    const acceptMatch = text.match(/Accept:\s*\[([A-Za-z0-9-]+)\]/i);
+    return acceptMatch?.[1] ?? null;
+  }
+
+  private resolveCandidateAgentIds(input?: string[]): string[] {
+    const normalizedInput = (input ?? []).map((item) => this.normalizeChatId(item)).filter(Boolean);
+    return Array.from(new Set(normalizedInput.length ? normalizedInput : this.defaultAgentChatIds));
+  }
+
+  private normalizeChatId(chatId: string): string {
+    return chatId.trim();
+  }
+
+  private async tryClaimTask(taskId: string, agentChatId: string): Promise<void> {
+    const routing = this.taskRouting.get(taskId);
+    if (!routing) {
+      return;
+    }
+    const normalizedAgentId = this.normalizeChatId(agentChatId);
+    if (!routing.candidateAgentIds.includes(normalizedAgentId)) {
+      return;
+    }
+    if (routing.acceptedAgentId && routing.acceptedAgentId !== normalizedAgentId) {
+      if (this.whatsappGateway) {
+        await this.whatsappGateway.sendMessage(normalizedAgentId, `Task [${taskId}] already claimed by another agent.`);
+      }
+      return;
+    }
+    if (!routing.acceptedAgentId) {
+      const updatedRouting: TaskRoutingState = {
+        ...routing,
+        acceptedAgentId: normalizedAgentId,
+        acceptedAt: new Date().toISOString()
+      };
+      this.taskRouting.set(taskId, updatedRouting);
+      const task = this.tasks.get(taskId);
+      if (task) {
+        this.tasks.set(
+          taskId,
+          VectorTaskSchema.parse({
+            ...task,
+            agentWallet: task.agentWallet ?? normalizedAgentId
+          })
+        );
+      }
+      if (this.whatsappGateway) {
+        await this.whatsappGateway.sendMessage(normalizedAgentId, `Task [${taskId}] claim confirmed. You are locked as assignee.`);
+      }
+      console.info(`[VectorBridge] task claimed: taskId=${taskId}, agent=${normalizedAgentId}`);
+    }
+  }
+
   private async handleIncomingAgentMessage(message: WhatsappIncomingMessage): Promise<void> {
-    if (message.from !== this.agentChatId || !message.hasMedia) {
+    const normalizedFrom = this.normalizeChatId(message.from);
+    const acceptTaskId = this.parseAcceptTaskIdFromMessage(message.body ?? "");
+    if (acceptTaskId) {
+      await this.tryClaimTask(acceptTaskId, normalizedFrom);
+    }
+    if (!message.hasMedia) {
       return;
     }
 
@@ -423,6 +519,18 @@ export class VectorBridge {
     if (!taskId) {
       console.warn("[VectorBridge] auto reflection ignored: media message without task reference");
       return;
+    }
+
+    const routing = this.taskRouting.get(taskId);
+    const acceptedAgentId = routing?.acceptedAgentId;
+    if (acceptedAgentId && acceptedAgentId !== normalizedFrom) {
+      console.warn(
+        `[VectorBridge] auto reflection ignored: taskId=${taskId} acceptedAgent=${acceptedAgentId} sender=${normalizedFrom}`
+      );
+      return;
+    }
+    if (!acceptedAgentId && routing) {
+      await this.tryClaimTask(taskId, normalizedFrom);
     }
 
     const media = await message.downloadMedia();

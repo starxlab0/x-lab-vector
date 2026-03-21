@@ -1,13 +1,15 @@
 import { Indexer, MemData } from "@0glabs/0g-ts-sdk";
 import { ethers } from "ethers";
 import { z } from "zod";
+import exifr from "exifr";
 
 import { VectorTask, VectorTaskSchema } from "../../schema/Task.js";
 
 export const FieldMetadataSchema = z.object({
   latitude: z.number(),
   longitude: z.number(),
-  capturedAt: z.string().datetime()
+  capturedAt: z.string().datetime(),
+  deviceFingerprint: z.string().min(1)
 });
 
 export const EvidenceInputSchema = z.object({
@@ -33,13 +35,101 @@ export interface EvidenceProcessResult {
   buyerView: string;
 }
 
+const TASK_LOCATION_MAP: Record<string, { latitude: number; longitude: number; label: string }> = {
+  UAE: { latitude: 25.204849, longitude: 55.270783, label: "Dubai" },
+  SGP: { latitude: 1.352083, longitude: 103.819839, label: "Singapore" },
+  SAU: { latitude: 24.713551, longitude: 46.675296, label: "Riyadh" }
+};
+
+const toRadians = (degrees: number): number => (degrees * Math.PI) / 180;
+
+const calculateDistanceKm = (
+  source: { latitude: number; longitude: number },
+  target: { latitude: number; longitude: number }
+): number => {
+  const earthRadiusKm = 6371;
+  const deltaLat = toRadians(target.latitude - source.latitude);
+  const deltaLng = toRadians(target.longitude - source.longitude);
+  const lat1 = toRadians(source.latitude);
+  const lat2 = toRadians(target.latitude);
+  const a =
+    Math.sin(deltaLat / 2) * Math.sin(deltaLat / 2) +
+    Math.sin(deltaLng / 2) * Math.sin(deltaLng / 2) * Math.cos(lat1) * Math.cos(lat2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Number((earthRadiusKm * c).toFixed(2));
+};
+
+const normalizeExifDate = (value: unknown): string | null => {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString();
+  }
+  if (typeof value === "string" && value.trim()) {
+    const candidate = value.replace(/^(\d{4}):(\d{2}):(\d{2})/, "$1-$2-$3");
+    const parsed = new Date(candidate);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+  return null;
+};
+
+const buildDeviceFingerprint = (source: Record<string, unknown>): string => {
+  const fields = [
+    source.Make,
+    source.Model,
+    source.Software,
+    source.LensModel,
+    source.BodySerialNumber,
+    source.ImageWidth,
+    source.ImageHeight
+  ]
+    .map((item) => (item == null ? "" : String(item).trim()))
+    .filter(Boolean)
+    .join("|");
+  return ethers.id(fields || "unknown-device");
+};
+
+const extractFieldMetadata = async (imageBuffer: Buffer): Promise<FieldMetadata | null> => {
+  try {
+    const parsed = (await exifr.parse(imageBuffer)) as Record<string, unknown> | null;
+    if (!parsed) {
+      return null;
+    }
+    const latitude = Number(parsed.latitude);
+    const longitude = Number(parsed.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return null;
+    }
+    const capturedAt =
+      normalizeExifDate(parsed.DateTimeOriginal) ??
+      normalizeExifDate(parsed.CreateDate) ??
+      normalizeExifDate(parsed.ModifyDate) ??
+      new Date().toISOString();
+    return FieldMetadataSchema.parse({
+      latitude: Number(latitude.toFixed(6)),
+      longitude: Number(longitude.toFixed(6)),
+      capturedAt,
+      deviceFingerprint: buildDeviceFingerprint(parsed)
+    });
+  } catch {
+    return null;
+  }
+};
+
 const sampleDubaiMetadata = (): FieldMetadata => {
   const latitude = 25.2048 + Math.random() * 0.01;
   const longitude = 55.2708 + Math.random() * 0.01;
   return FieldMetadataSchema.parse({
     latitude: Number(latitude.toFixed(6)),
     longitude: Number(longitude.toFixed(6)),
-    capturedAt: new Date().toISOString()
+    capturedAt: new Date().toISOString(),
+    deviceFingerprint: ethers.id(`simulated-device-${Date.now()}`)
   });
 };
 
@@ -91,7 +181,22 @@ const uploadToZeroG = async (
 
 export const processEvidence = async (input: EvidenceInput): Promise<EvidenceProcessResult> => {
   const parsed = EvidenceInputSchema.parse(input);
-  const metadata = sampleDubaiMetadata();
+  const extractedMetadata = await extractFieldMetadata(parsed.imageBuffer);
+  const metadata = extractedMetadata ?? sampleDubaiMetadata();
+  const expectedLocation = TASK_LOCATION_MAP[parsed.task.country.toUpperCase()] ?? TASK_LOCATION_MAP.UAE;
+  const hasGeoMismatch = extractedMetadata
+    ? calculateDistanceKm(
+        { latitude: extractedMetadata.latitude, longitude: extractedMetadata.longitude },
+        { latitude: expectedLocation.latitude, longitude: expectedLocation.longitude }
+      ) > 5
+    : true;
+  const isGeoRiskBlocked = !extractedMetadata || hasGeoMismatch;
+  const geoDistanceKm = extractedMetadata
+    ? calculateDistanceKm(
+        { latitude: extractedMetadata.latitude, longitude: extractedMetadata.longitude },
+        { latitude: expectedLocation.latitude, longitude: expectedLocation.longitude }
+      )
+    : null;
   const payloadBuffer = Buffer.from(
     JSON.stringify({
       imageBase64: parsed.imageBuffer.toString("base64"),
@@ -103,49 +208,69 @@ export const processEvidence = async (input: EvidenceInput): Promise<EvidencePro
 
   console.info(`[VectorVault] evidence process started: trigger=${parsed.trigger}, taskId=${parsed.task.taskId}`);
   const uploadResult = await uploadToZeroG(payloadBuffer);
-  const isPendingStorage = uploadResult.storageStatus === "PENDING_STORAGE";
+  const isPendingStorage = uploadResult.storageStatus === "PENDING_STORAGE" && !isGeoRiskBlocked;
   const proofUrl = `https://explorer.0g.ai/tx/${uploadResult.txHash ?? uploadResult.rootHash}`;
   const updatedTask = VectorTaskSchema.parse({
     ...parsed.task,
-    status: isPendingStorage ? "pending_storage" : "in_progress",
+    status: isGeoRiskBlocked ? "blocked" : isPendingStorage ? "pending_storage" : "in_progress",
     bossSnapshot: {
       ...parsed.task.bossSnapshot,
-      progress: isPendingStorage ? "证据已接收，等待 0G 节点恢复后补传。" : "证据已上传 0G，等待最终复核。",
-      risk: isPendingStorage ? "0G 节点暂时不可用，已标记待上链。" : "链上凭证已落地，风险显著下降。",
-      summaryZh: isPendingStorage
+      progress: isGeoRiskBlocked
+        ? "证据已接收，但地理信息异常，任务已冻结待人工复核。"
+        : isPendingStorage
+          ? "证据已接收，等待 0G 节点恢复后补传。"
+          : "证据已上传 0G，等待最终复核。",
+      risk: isGeoRiskBlocked
+        ? "证据缺失 GPS 或定位偏差超过 5km，触发风控冻结。"
+        : isPendingStorage
+          ? "0G 节点暂时不可用，已标记待上链。"
+          : "链上凭证已落地，风险显著下降。",
+      summaryZh: isGeoRiskBlocked
+        ? `任务 ${parsed.task.taskId} 触发地理风控并转为阻断状态。`
+        : isPendingStorage
         ? `任务 ${parsed.task.taskId} 进入待存证状态。`
         : `任务 ${parsed.task.taskId} 已完成证据上链。`,
-      riskLevel: isPendingStorage ? "medium" : "low"
+      riskLevel: isGeoRiskBlocked ? "critical" : isPendingStorage ? "medium" : "low"
     },
     expertAudit: {
       ...parsed.task.expertAudit,
       zeroGRootHash: uploadResult.rootHash,
       proofHash: uploadResult.rootHash,
-      complianceCode: isPendingStorage ? "PENDING_STORAGE" : "EVIDENCE_VERIFIED",
+      complianceCode: isGeoRiskBlocked ? "GEO_RISK_BLOCKED" : isPendingStorage ? "PENDING_STORAGE" : "EVIDENCE_VERIFIED",
       verifiedAt: new Date().toISOString()
     },
     buyerGateway: {
       ...parsed.task.buyerGateway,
-      executiveSummary: isPendingStorage
+      executiveSummary: isGeoRiskBlocked
+        ? `Task ${parsed.task.taskId} evidence intake detected a geolocation anomaly and has been escalated for manual compliance review before buyer release.`
+        : isPendingStorage
         ? `Task ${parsed.task.taskId} evidence is captured and queued for ${uploadResult.storageLayer} anchoring due to temporary node interruption.`
         : `Task ${parsed.task.taskId} evidence has been anchored to ${uploadResult.storageLayer} with verifiable proof hash.`,
       trustHighlights: [
         ...parsed.task.buyerGateway.trustHighlights,
-        `Root Hash anchored: ${uploadResult.rootHash}`
+        `Root Hash anchored: ${uploadResult.rootHash}`,
+        `Device Fingerprint: ${metadata.deviceFingerprint.slice(0, 12)}...`,
+        `Geo Distance to ${expectedLocation.label}: ${geoDistanceKm ?? "N/A"} km`
       ]
     }
   });
 
-  const bossView = isPendingStorage
-    ? `⏳ 核真证据已接收，待写入 0G 链。地点：${parsed.locationLabel}；状态：PENDING_STORAGE。`
-    : `✅ 核真证据已上传 0G 链。地点：${parsed.locationLabel}；状态：真实可信。`;
-  const expertView = `🔗 Root Hash: ${uploadResult.rootHash}；数据可用性层：${uploadResult.storageLayer}。`;
+  const bossView = isGeoRiskBlocked
+    ? `🚨 风险预警：证据地理位置异常！任务已阻断。目标区域：${expectedLocation.label}；检测坐标：${metadata.latitude}, ${metadata.longitude}。`
+    : isPendingStorage
+      ? `⏳ 核真证据已接收，待写入 0G 链。地点：${parsed.locationLabel}；状态：PENDING_STORAGE。`
+      : `✅ 核真证据已上传 0G 链。地点：${parsed.locationLabel}；状态：真实可信。`;
+  const expertView = [
+    `🔗 Root Hash: ${uploadResult.rootHash}；数据可用性层：${uploadResult.storageLayer}。`,
+    `📍 GPS: ${metadata.latitude}, ${metadata.longitude}；目标区域：${expectedLocation.label}；偏差：${geoDistanceKm ?? "N/A"} km。`,
+    `🧬 Device Fingerprint: ${metadata.deviceFingerprint}`
+  ].join("\n");
   const buyerView = [
     `Status Report Preview`,
     `Task ID: ${updatedTask.taskId}`,
     `Country: ${updatedTask.country}`,
     `Service: ${updatedTask.serviceLine}`,
-    `Evidence Integrity: ${isPendingStorage ? "Pending storage settlement" : `Verified on ${uploadResult.storageLayer}`}`,
+    `Evidence Integrity: ${isGeoRiskBlocked ? "Blocked by geo risk control" : isPendingStorage ? "Pending storage settlement" : `Verified on ${uploadResult.storageLayer}`}`,
     `Proof Hash: ${uploadResult.rootHash}`
   ].join("\n");
   console.info(

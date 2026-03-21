@@ -1,4 +1,4 @@
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
 export interface AgentReputationRecord {
@@ -17,11 +17,14 @@ interface ReputationStore {
 
 export class ReputationManager {
   private readonly storePath: string;
+  private readonly lockPath: string;
   private readonly records = new Map<string, AgentReputationRecord>();
   private restorePromise: Promise<void>;
+  private persistQueue: Promise<void> = Promise.resolve();
 
   constructor(storePath = resolve(process.cwd(), "agent_reputation.json")) {
     this.storePath = storePath;
+    this.lockPath = `${storePath}.lock`;
     this.restorePromise = this.restore();
   }
 
@@ -156,11 +159,18 @@ export class ReputationManager {
   }
 
   private async persist(): Promise<void> {
-    const payload: ReputationStore = {
-      version: 1,
-      agents: Object.fromEntries(this.records.entries())
-    };
-    await writeFile(this.storePath, JSON.stringify(payload, null, 2), "utf-8");
+    this.persistQueue = this.persistQueue.then(async () => {
+      const payload: ReputationStore = {
+        version: 1,
+        agents: Object.fromEntries(this.records.entries())
+      };
+      await this.withFileLock(async () => {
+        const tempPath = `${this.storePath}.${process.pid}.${Date.now()}.tmp`;
+        await writeFile(tempPath, JSON.stringify(payload, null, 2), "utf-8");
+        await rename(tempPath, this.storePath);
+      });
+    });
+    await this.persistQueue;
   }
 
   private createEmptyRecord(agentId: string): AgentReputationRecord {
@@ -183,5 +193,30 @@ export class ReputationManager {
     }
     const bounded = Math.min(5, Math.max(1, rating));
     return Number(bounded.toFixed(2));
+  }
+
+  private async withFileLock<T>(executor: () => Promise<T>): Promise<T> {
+    const startedAt = Date.now();
+    const timeoutMs = 5000;
+    while (true) {
+      try {
+        const lockHandle = await open(this.lockPath, "wx");
+        try {
+          return await executor();
+        } finally {
+          await lockHandle.close();
+          await rm(this.lockPath, { force: true });
+        }
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
+        if (code !== "EEXIST") {
+          throw error;
+        }
+        if (Date.now() - startedAt > timeoutMs) {
+          throw new Error("reputation store lock timeout");
+        }
+        await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+      }
+    }
   }
 }
