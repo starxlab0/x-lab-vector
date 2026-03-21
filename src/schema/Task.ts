@@ -1,12 +1,17 @@
 import { z } from "zod";
 
 const riskLevels = ["low", "medium", "high", "critical"] as const;
+export const TASK_STATUS = ["queued", "in_progress", "pending_storage", "blocked", "completed", "SETTLED"] as const;
+export type TaskStatus = (typeof TASK_STATUS)[number];
 
 export const VectorTaskSchema = z.object({
   taskId: z.string().min(1),
   country: z.string().min(2),
   serviceLine: z.string().min(1),
-  status: z.enum(["queued", "in_progress", "pending_storage", "blocked", "completed"]),
+  status: z.enum(TASK_STATUS),
+  rewardAmount: z.number().default(0),
+  rating: z.number().min(1).max(5).optional(),
+  agentWallet: z.string().optional(),
   bossSnapshot: z.object({
     progress: z.string().min(1),
     risk: z.string().min(1),
@@ -42,12 +47,20 @@ export const createBuyerGatewayTemplate = (task: Pick<VectorTask, "taskId" | "co
   };
 };
 
-export const createVectorTask = (input: { taskId: string; country: string; serviceLine: string }): VectorTask => {
+export const createVectorTask = (input: {
+  taskId: string;
+  country: string;
+  serviceLine: string;
+  rewardAmount?: number;
+  agentWallet?: string;
+}): VectorTask => {
   return VectorTaskSchema.parse({
     taskId: input.taskId,
     country: input.country.toUpperCase(),
     serviceLine: input.serviceLine,
     status: "queued",
+    rewardAmount: input.rewardAmount ?? 0,
+    agentWallet: input.agentWallet,
     bossSnapshot: {
       progress: "任务已下发，等待代理人回传证据。",
       risk: "现场证据未回传前无法完成最终核验。",

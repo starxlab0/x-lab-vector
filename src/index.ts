@@ -15,6 +15,12 @@ import {
   resolveCountryServices
 } from "./services/bridge/VectorMatrix.js";
 
+const renderCreditStars = (reputationScore: number): string => {
+  const bounded = Math.max(0, Math.min(5, reputationScore));
+  const rounded = Math.round(bounded);
+  return `${"⭐".repeat(rounded)}${"☆".repeat(5 - rounded)}`;
+};
+
 const createWhatsappGateway = async (): Promise<WhatsappGateway | undefined> => {
   if (process.env.WA_ENABLED !== "true") {
     return undefined;
@@ -145,7 +151,15 @@ export const bootstrapVectorCore = async () => {
         return;
       }
 
-      const keyboard = Markup.inlineKeyboard([[Markup.button.url("查看 0G 浏览器证据", payload.proofUrl)]]);
+      const reputation = await bridge.getTaskAgentReputation(payload.task.taskId);
+      const creditStars = renderCreditStars(reputation?.reputationScore ?? 0);
+      const keyboard =
+        payload.storageStatus === "CONFIRMED" && payload.task.status === "completed"
+          ? Markup.inlineKeyboard([
+              [Markup.button.url("查看 0G 浏览器证据", payload.proofUrl)],
+              [Markup.button.callback("✅ 确认验收", `settle:confirm:${payload.task.taskId}`)]
+            ])
+          : Markup.inlineKeyboard([[Markup.button.url("查看 0G 浏览器证据", payload.proofUrl)]]);
       const triggerLabel =
         payload.trigger === "auto_reflection"
           ? "自动反射"
@@ -154,7 +168,7 @@ export const bootstrapVectorCore = async () => {
             : "手动触发";
       await bot.telegram.sendMessage(
         bossChatId,
-        `${payload.bossView}\n触发来源：${triggerLabel}`,
+        `${payload.bossView}\n触发来源：${triggerLabel}\n代理人信用：${creditStars}`,
         keyboard
       );
       await bot.telegram.sendMessage(bossChatId, payload.expertView);
@@ -246,6 +260,45 @@ export const bootstrapVectorCore = async () => {
       );
       await ctx.answerCbQuery("下发失败，请检查 WA 登录状态", { show_alert: true });
       await ctx.reply("❌ 任务下发失败：请检查 WhatsApp 登录状态和 WA_AGENT_CHAT_ID");
+    }
+  });
+
+  bot.action(/^settle:confirm:([A-Za-z0-9-]+)$/, async (ctx) => {
+    if (!bossChatId || String(ctx.chat?.id ?? "") !== bossChatId) {
+      await ctx.answerCbQuery("仅老板账号可执行验收");
+      return;
+    }
+    const taskId = String(ctx.match[1]);
+    const ratingButtons = [
+      [Markup.button.callback("1⭐", `settle:rate:${taskId}:1`)],
+      [Markup.button.callback("2⭐", `settle:rate:${taskId}:2`)],
+      [Markup.button.callback("3⭐", `settle:rate:${taskId}:3`)],
+      [Markup.button.callback("4⭐", `settle:rate:${taskId}:4`)],
+      [Markup.button.callback("5⭐", `settle:rate:${taskId}:5`)]
+    ];
+    await ctx.reply(`请为任务 ${taskId} 评分：`, Markup.inlineKeyboard(ratingButtons));
+    await ctx.answerCbQuery("请选择评分");
+  });
+
+  bot.action(/^settle:rate:([A-Za-z0-9-]+):([1-5])$/, async (ctx) => {
+    if (!bossChatId || String(ctx.chat?.id ?? "") !== bossChatId) {
+      await ctx.answerCbQuery("仅老板账号可执行结算");
+      return;
+    }
+    const taskId = String(ctx.match[1]);
+    const rating = Number(ctx.match[2]);
+    try {
+      const settlement = await bridge.settleTask(taskId, rating);
+      const creditStars = renderCreditStars(settlement.reputation?.reputationScore ?? 0);
+      await ctx.reply(
+        `💰 账单已生成！实付: ${settlement.rewardAmount} USDT | X-LAB 服务费 (20%): ${settlement.serviceFee} USDT | 代理人实收: ${settlement.agentNetIncome} USDT`
+      );
+      await ctx.reply(`✅ 任务已结算\nTask ID: ${taskId}\n评分: ${rating}⭐\n代理人信用：${creditStars}`);
+      await ctx.answerCbQuery("已完成评分结算");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await ctx.answerCbQuery("结算失败", { show_alert: true });
+      await ctx.reply(`❌ 评分结算失败：${message}`);
     }
   });
 

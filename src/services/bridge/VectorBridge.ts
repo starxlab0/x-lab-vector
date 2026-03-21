@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import { createVectorTask, VectorTask, VectorTaskSchema } from "../../schema/Task.js";
 import { actionToCapability, ServiceAction } from "./VectorMatrix.js";
 import { processEvidence } from "../vault/VectorVault.js";
+import { AgentReputationRecord, ReputationManager } from "../reputation/ReputationService.js";
 
 export interface WhatsappIncomingMedia {
   mimetype: string;
@@ -44,6 +45,12 @@ export interface VectorBridgeConfig {
   whatsappGateway?: WhatsappGateway;
   onThreeViewUpdate?: (payload: ThreeViewNotificationPayload) => Promise<void> | void;
   onRetrySettlement?: (payload: RetrySettlementPayload) => Promise<void> | void;
+  reputationManager?: ReputationManager;
+}
+
+export interface DispatchTaskOptions {
+  rewardAmount?: number;
+  agentWallet?: string;
 }
 
 export interface DispatchResult {
@@ -66,6 +73,7 @@ export class VectorBridge {
   private readonly whatsappGateway?: WhatsappGateway;
   private readonly onThreeViewUpdate?: (payload: ThreeViewNotificationPayload) => Promise<void> | void;
   private readonly onRetrySettlement?: (payload: RetrySettlementPayload) => Promise<void> | void;
+  private readonly reputationManager: ReputationManager;
   private readonly pendingStorePath: string;
   private readonly retryTimer: NodeJS.Timeout;
 
@@ -74,6 +82,7 @@ export class VectorBridge {
     this.whatsappGateway = config.whatsappGateway;
     this.onThreeViewUpdate = config.onThreeViewUpdate;
     this.onRetrySettlement = config.onRetrySettlement;
+    this.reputationManager = config.reputationManager ?? new ReputationManager();
     this.pendingStorePath = resolve(process.cwd(), "pending_tasks.json");
     void this.restorePendingQueue();
     if (this.whatsappGateway?.onMessage) {
@@ -87,7 +96,11 @@ export class VectorBridge {
     this.retryTimer.unref?.();
   }
 
-  public async dispatchTask(countryCode: string, action: ServiceAction): Promise<DispatchResult> {
+  public async dispatchTask(
+    countryCode: string,
+    action: ServiceAction,
+    options: DispatchTaskOptions = {}
+  ): Promise<DispatchResult> {
     const capability = actionToCapability(action);
     if (!capability) {
       throw new Error(`Unsupported service action: ${action}`);
@@ -97,13 +110,16 @@ export class VectorBridge {
     const task = createVectorTask({
       taskId,
       country: countryCode,
-      serviceLine: capability
+      serviceLine: capability,
+      rewardAmount: options.rewardAmount,
+      agentWallet: options.agentWallet
     });
 
     const instruction = [
       `Task ID: ${taskId}`,
       `Country: ${countryCode.toUpperCase()}`,
       `Service: ${capability}`,
+      `Reward (USDT): ${task.rewardAmount}`,
       `Ref: [${taskId}]`,
       `Instruction: Please execute on-site ${capability.toLowerCase()} and return photo evidence with timestamp and coordinates.`
     ].join("\n");
@@ -119,6 +135,53 @@ export class VectorBridge {
 
   public getTask(taskId: string): VectorTask | null {
     return this.tasks.get(taskId) ?? null;
+  }
+
+  public async getTaskAgentReputation(taskId: string): Promise<AgentReputationRecord | null> {
+    const task = this.tasks.get(taskId);
+    if (!task) {
+      return null;
+    }
+    const agentId = task.agentWallet?.trim() || this.agentChatId.trim();
+    if (!agentId) {
+      return null;
+    }
+    return this.reputationManager.getAgentReputation(agentId);
+  }
+
+  public async settleTask(taskId: string, rating: number): Promise<{
+    task: VectorTask;
+    reputation: AgentReputationRecord | null;
+    rewardAmount: number;
+    serviceFee: number;
+    agentNetIncome: number;
+  }> {
+    const task = this.tasks.get(taskId);
+    if (!task) {
+      throw new Error(`Task not found: ${taskId}`);
+    }
+    if (task.status !== "completed" && task.status !== "SETTLED") {
+      throw new Error(`Task ${taskId} is not ready for settlement`);
+    }
+    const settledTask = VectorTaskSchema.parse({
+      ...task,
+      rating,
+      status: "SETTLED"
+    });
+    this.tasks.set(taskId, settledTask);
+
+    const agentId = settledTask.agentWallet?.trim() || this.agentChatId.trim();
+    const reputation = agentId ? await this.reputationManager.applySettlementRating(agentId, rating) : null;
+    const rewardAmount = Number(settledTask.rewardAmount.toFixed(2));
+    const serviceFee = Number((rewardAmount * 0.2).toFixed(2));
+    const agentNetIncome = Number((rewardAmount * 0.8).toFixed(2));
+    return {
+      task: settledTask,
+      reputation,
+      rewardAmount,
+      serviceFee,
+      agentNetIncome
+    };
   }
 
   public async processTaskEvidence(taskId: string, imageBuffer: Buffer): Promise<{
@@ -170,6 +233,7 @@ export class VectorBridge {
     } else {
       await this.dequeuePendingStorage(taskId);
     }
+    await this.updateReputationOnCompletion(finalizedTask, result.storageStatus);
 
     if (options.notifyThreeView && this.onThreeViewUpdate) {
       await this.onThreeViewUpdate({
@@ -207,15 +271,18 @@ export class VectorBridge {
     trigger: "manual" | "auto_reflection" | "retry_queue",
     storageStatus: "CONFIRMED" | "PENDING_STORAGE"
   ): VectorTask {
-    if (trigger === "retry_queue" && storageStatus === "CONFIRMED") {
+    if (storageStatus === "CONFIRMED") {
+      const isRetrySettlement = trigger === "retry_queue";
       return VectorTaskSchema.parse({
         ...updatedTask,
         status: "completed",
         bossSnapshot: {
           ...updatedTask.bossSnapshot,
-          progress: "存证补传成功，任务已闭环。",
+          progress: isRetrySettlement ? "存证补传成功，任务已闭环。" : "证据存证成功，任务已闭环。",
           risk: "链上哈希已锁定，风险关闭。",
-          summaryZh: `任务 ${updatedTask.taskId} 已在 0G 正式锁定。`,
+          summaryZh: isRetrySettlement
+            ? `任务 ${updatedTask.taskId} 已在 0G 正式锁定。`
+            : `任务 ${updatedTask.taskId} 已完成并写入 0G。`,
           riskLevel: "low"
         },
         expertAudit: {
@@ -225,6 +292,24 @@ export class VectorBridge {
       });
     }
     return updatedTask;
+  }
+
+  private async updateReputationOnCompletion(
+    task: VectorTask,
+    storageStatus: "CONFIRMED" | "PENDING_STORAGE"
+  ): Promise<void> {
+    if (task.status !== "completed" || storageStatus !== "CONFIRMED") {
+      return;
+    }
+    const fallbackAgentId = this.agentChatId.trim();
+    const agentId = task.agentWallet?.trim() || fallbackAgentId;
+    if (!agentId) {
+      return;
+    }
+    const record = await this.reputationManager.recordSuccess(agentId, task.rating);
+    console.info(
+      `[VectorBridge] reputation updated: agent=${agentId}, success=${record.successCount}, averageRating=${record.averageRating}, score=${record.reputationScore}`
+    );
   }
 
   private async retryPendingStorageQueue(): Promise<void> {
