@@ -35,6 +35,21 @@ export interface EvidenceProcessResult {
   buyerView: string;
 }
 
+export interface EvidenceConfirmedEvent {
+  task: VectorTask;
+  proofUrl: string;
+  rootHash: string;
+  metadata: FieldMetadata;
+}
+
+let evidenceConfirmedListener: ((event: EvidenceConfirmedEvent) => Promise<void> | void) | undefined;
+
+export const registerEvidenceConfirmedListener = (
+  listener: ((event: EvidenceConfirmedEvent) => Promise<void> | void) | undefined
+): void => {
+  evidenceConfirmedListener = listener;
+};
+
 const TASK_LOCATION_MAP: Record<string, { latitude: number; longitude: number; label: string }> = {
   UAE: { latitude: 25.204849, longitude: 55.270783, label: "Dubai" },
   SGP: { latitude: 1.352083, longitude: 103.819839, label: "Singapore" },
@@ -276,6 +291,19 @@ export const processEvidence = async (input: EvidenceInput): Promise<EvidencePro
   console.info(
     `[VectorVault] evidence process completed: trigger=${parsed.trigger}, taskId=${parsed.task.taskId}, storageStatus=${uploadResult.storageStatus}`
   );
+  if (!isGeoRiskBlocked && uploadResult.storageStatus === "CONFIRMED" && evidenceConfirmedListener) {
+    try {
+      await evidenceConfirmedListener({
+        task: updatedTask,
+        proofUrl,
+        rootHash: uploadResult.rootHash,
+        metadata
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      console.error(`[VectorVault] evidence confirmed listener failed: taskId=${parsed.task.taskId}, reason=${reason}`);
+    }
+  }
 
   return {
     updatedTask,

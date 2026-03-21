@@ -14,6 +14,8 @@ import {
   parseTaskActionCallback,
   resolveCountryServices
 } from "./services/bridge/VectorMatrix.js";
+import { registerEvidenceConfirmedListener } from "./services/vault/VectorVault.js";
+import { SocialEngine } from "./services/digital/SocialEngine.js";
 
 const renderCreditStars = (reputationScore: number): string => {
   const bounded = Math.max(0, Math.min(5, reputationScore));
@@ -141,6 +143,8 @@ export const bootstrapVectorCore = async () => {
   }
 
   const bot = new Telegraf(telegramToken);
+  const socialEngine = new SocialEngine();
+  let chatHostingMode = false;
   bot.catch((error, ctx) => {
     const callbackData = ctx.callbackQuery && "data" in ctx.callbackQuery ? ctx.callbackQuery.data : "n/a";
     console.error(`[VectorCore] bot handler error: callbackData=${callbackData}`, error);
@@ -192,6 +196,21 @@ export const bootstrapVectorCore = async () => {
     }
   });
 
+  registerEvidenceConfirmedListener(async (event) => {
+    if (!bossChatId) {
+      return;
+    }
+    const draft = socialEngine.generateEvidencePostDraft({
+      taskId: event.task.taskId,
+      country: event.task.country,
+      serviceLine: event.task.serviceLine,
+      proofUrl: event.proofUrl,
+      rootHash: event.rootHash,
+      capturedAt: event.metadata.capturedAt
+    });
+    await bot.telegram.sendMessage(bossChatId, draft);
+  });
+
   bot.start(async (ctx) => {
     await ctx.reply("请选择执行国家：", Markup.inlineKeyboard(buildCountryButtons()));
   });
@@ -223,6 +242,63 @@ export const bootstrapVectorCore = async () => {
 
   bot.command("currentboss", async (ctx) => {
     await ctx.reply(`current boss chat id: ${bossChatId ?? "未设置"}`);
+  });
+
+  bot.command("chat", async (ctx) => {
+    const text = ctx.message && "text" in ctx.message ? ctx.message.text : "";
+    const command = text.split(" ").slice(1).join(" ").trim().toLowerCase();
+    if (command === "on") {
+      chatHostingMode = true;
+    } else if (command === "off") {
+      chatHostingMode = false;
+    } else if (!command) {
+      chatHostingMode = !chatHostingMode;
+    }
+    await ctx.reply(`数字代理人托管模式：${chatHostingMode ? "已开启" : "已关闭"}`);
+  });
+
+  bot.on("text", async (ctx, next) => {
+    const text = ctx.message?.text ?? "";
+    if (!text || text.startsWith("/")) {
+      await next();
+      return;
+    }
+    if (!chatHostingMode) {
+      await next();
+      return;
+    }
+    const chatId = String(ctx.chat.id);
+    const senderRole = bossChatId && chatId === bossChatId ? "boss" : "buyer";
+    const result = socialEngine.handleMessage({
+      channel: "telegram",
+      chatId,
+      text,
+      senderRole
+    });
+    if (result.shouldReply && result.replyText) {
+      await ctx.reply(result.replyText);
+    }
+    if (result.shouldCreateTask && result.taskProposal) {
+      try {
+        const dispatch = await bridge.dispatchTask(result.taskProposal.countryCode, result.taskProposal.action, {
+          agentChatIds,
+          rewardAmount: result.taskProposal.rewardAmount,
+          taskDescription: result.taskProposal.taskDescription
+        });
+        await ctx.reply(
+          [
+            `🤖 已由数字代理人创建任务`,
+            `Task ID: ${dispatch.task.taskId}`,
+            `Service: ${dispatch.task.serviceLine}`,
+            `Country: ${dispatch.task.country}`
+          ].join("\n")
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        await ctx.reply(`❌ 数字代理人创建任务失败：${message}`);
+      }
+    }
+    await next();
   });
 
   bot.action(/^country:(.+)$/, async (ctx) => {
@@ -332,6 +408,29 @@ export const bootstrapVectorCore = async () => {
       Markup.inlineKeyboard([[Markup.button.url("查看 0G 浏览器证据", result.proofUrl)]])
     );
     await ctx.reply(`Storage Status: ${result.storageStatus}`);
+  });
+
+  whatsappGateway?.onMessage?.(async (message) => {
+    if (message.hasMedia || !chatHostingMode) {
+      return;
+    }
+    const inboundText = message.body?.trim() ?? "";
+    if (!inboundText || /^accept:\s*\[[a-z0-9-]+\]/i.test(inboundText)) {
+      return;
+    }
+    const senderRole = agentChatIds.includes(message.from) ? "agent" : "buyer";
+    if (senderRole !== "buyer") {
+      return;
+    }
+    const result = socialEngine.handleMessage({
+      channel: "whatsapp",
+      chatId: message.from,
+      text: inboundText,
+      senderRole
+    });
+    if (result.shouldReply && result.replyText && whatsappGateway) {
+      await whatsappGateway.sendMessage(message.from, result.replyText);
+    }
   });
 
   let launched = false;
